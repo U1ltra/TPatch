@@ -9,9 +9,9 @@ from torch.utils.data import DataLoader
 from tpatch import TVLoss, TPatch, ContentLoss
 
 __all__ = [
-    "load_coco", "LabelConverter", "eval_det", "eval_det_details", "train_det_CA", "train_det_HA",
-    "xyxy2cxcywh", "train_det_CA_full", "eval_det_full", "train_det_HA_full", "cxcywh2xyxy",
-    "_make_boxes", "train_det_HA_general", "eval_det_general", "eval_cls_full", "train_cls_AA",
+    "load_coco", "LabelConverter", 
+    "xyxy2cxcywh",  "cxcywh2xyxy",
+    "_make_boxes",  
     "isappear"
 ]
 

@@ -7,6 +7,7 @@ import torchvision as tv
 import numpy as np
 import matplotlib.pyplot as plt
 
+from tqdm import tqdm
 from datetime import datetime
 from PIL import Image
 from classifier import *
@@ -39,15 +40,15 @@ class AdaptiveAxes:
 coco_img = "dataset/mscoco/val2014"
 coco_ann = "dataset/mscoco/annotations/instances_val2014.json"
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 device = "cuda:0"
 out_dir = "demo"
 if not os.path.exists(out_dir):
     os.makedirs(out_dir)
-attack_type = "CA"
+attack_type = "HA"
 target_name = "stop sign"
 double_apply = False
-model_type = "rcnn"
+model_type = "yolov5"
 converter = LabelConverter()
 if model_type == "rcnn":
     names = converter.category91
@@ -57,8 +58,8 @@ elif model_type == "yolov5":
     names = converter.category80
 target_id = names.index(target_name)
 model = get_det_model(device, model_type)
-trigger_gen = TriggerRegion((0.02, 0.08), (100., 140.), (0, 20))
-trigger_func = lambda x, tr: stn_blur_general(x, tr[0], tr[1], math.radians(tr[2]), 60, device)
+trigger_gen = TriggerRegion((0.02, 0.08), (100., 140.), (0, 20)) # configure blur parameters
+trigger_func = lambda x, tr: stn_blur_general(x, tr[0], tr[1], math.radians(tr[2]), 60, device) # generate and apply blur kernel
 
 bgsize = (200, 200)
 
@@ -100,13 +101,12 @@ elif attack_type == "HA":
     else:
         content = "usenix_text.png"
 
-a = tv.models.vgg19(True).to(device)
+a = tv.models.vgg19(False).to(device)
+a.load_state_dict(torch.load("weights/vgg19-dcbb9e9d.pth"))
 content_loss = ContentLoss(a.features, content, device, extract_layer=11)
 tv_loss = TVLoss()
 
-filename = f"{random.randint(0, 999999):06d}.png"
-while os.path.exists(os.path.join(out_dir, filename)):
-    filename = f"{random.randint(0, 999999):06d}.png"
+filename = datetime.now().strftime("%Y%m%d-%H%M%S") + ".png"
 
 # === eval only ===
 # filename = "137498.png"
@@ -153,6 +153,10 @@ def train(train_loader):
     t1 = datetime.now()
     log_loss = torch.zeros(4, device=device)
     
+    pbar = tqdm(total=epoch * repeat)
+    pbar.set_description("Training")
+    pbar.update(0)
+    
     for i, img in enumerate(train_loader, 1):
         if isinstance(img, list) or isinstance(img, tuple):
             img = img[0]
@@ -188,6 +192,15 @@ def train(train_loader):
             log_loss += torch.tensor((loss1.item(), loss2.item(), loss3.item(), loss4.item()), device=device)
             patch.update(loss)
             
+            pbar.update(1)
+            pbar.set_postfix({
+                "loss": f"{loss.item():.4f}",
+                "loss1": f"{loss1.item():.4f}",
+                "loss2": f"{loss2.item():.4f}",
+                "loss3": f"{loss3.item():.4f}",
+                "loss4": f"{loss4.item():.4f}"
+            })
+            
         if i == 1:
             t2 = datetime.now()
             pred_time = (t2-t1) * (epoch-1)
@@ -202,6 +215,10 @@ def eval(test_loader):
     t1 = datetime.now()
     success, success_1, success_2 = 0, 0, 0
     logs = []
+    
+    pbar = tqdm(total=num)
+    pbar.set_description("Evaluating")
+    pbar.update(0)
     
     for i, img in enumerate(test_loader, 1):
         if isinstance(img, list) or isinstance(img, tuple):
@@ -275,6 +292,8 @@ def eval(test_loader):
         log = [set_resize, np.degrees(set_rotate), p_r, np.degrees(p_th), p_tr[2], 
                n_r, np.degrees(n_th), n_tr[2], s1, s2, s]
         logs.append(log)
+        
+        pbar.update(1)
 
         if i == 10:
             t2 = datetime.now()
@@ -289,11 +308,15 @@ def main():
     decay_epoch = 2
     n_decay = 3
     for e in range(1, decay_epoch * n_decay + 1):
+        print(f"Memory allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
+        print(f"Memory reserved: {torch.cuda.memory_reserved() / 1024**2:.2f} MB")
+        
         print(f"Epoch {e}: start training...")
         losses = train(loader1)
         print(losses)
         print(f"Epoch {e}: start evaluating...")
-        sucs, logs = eval(loader2)
+        with torch.no_grad():
+            sucs, logs = eval(loader2)
         print(sucs)
         patch.save(save_path)
         if e % decay_epoch == 0:
