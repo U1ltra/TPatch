@@ -2,6 +2,7 @@ import _init_path
 import os
 import math
 import random
+import pickle
 import torch
 import torchvision as tv
 import numpy as np
@@ -190,16 +191,16 @@ def train(train_loader):
     return log_loss / (epoch * repeat)
 
 
-def eval(test_loader):
+def eval(test_loader, results_path=None):
     model.eval()
     t1 = datetime.now()
     success = 0
-    logs = []
-    
+    results = []
+
     pbar = tqdm(total=num)
     pbar.set_description("Evaluating")
     pbar.update(0)
-    
+
     for i, img in enumerate(test_loader, 1):
         if isinstance(img, list) or isinstance(img, tuple):
             img = img[0]
@@ -207,33 +208,41 @@ def eval(test_loader):
         h, w = img.shape[-2:]
         set_resize = random.uniform(eot_scale, 1)
         set_rotate = random.uniform(-eot_angle, eot_angle)
-        
+
         if attack_type == "CA":
             pos = patch.random_pos((h, w))
-            imgo = patch.apply(img, pos, test_mode=True, set_resize=set_resize, 
+            imgo = patch.apply(img, pos, test_mode=True, set_resize=set_resize,
                                set_rotate=set_rotate)
         elif attack_type == "HA":
             pos = patch2.random_pos((h, w))
-            dx, dy = 0, 0
-            relpos2 = (relpos[0]+dx, relpos[1]+dy)
+            relpos2 = (relpos[0], relpos[1])
             patch2.data = patch.apply(quick_load("stop_sign.png"), relpos2, test_mode=True, do_random_color=False)
             if double_apply:
-                dx, dy = 0, 0
-                relpos2 = (relpos3[0]+dx, relpos3[1]+dy)
+                relpos2 = (relpos3[0], relpos3[1])
                 patch2.data = patch.apply(patch2.data, relpos2, test_mode=True, do_random_color=False)
             imgo = patch2.apply(img, pos, test_mode=True, set_resize=set_resize, set_rotate=set_rotate, do_random_color=True)
 
-        pred = model(imgo)[0]
+        # get both post-NMS detections and the raw pre-NMS tensor
+        nms_preds, pred_raw = model(imgo, return_raw=True)
+        pred = nms_preds[0]   # post-NMS: [K, 6] = [x1,y1,x2,y2,conf,cls]
+
+        # --- pre-NMS: filter to objectness > 0.01 to keep file size manageable ---
+        raw = pred_raw[0]                        # [N, 5+C]
+        keep = raw[:, 4] > 0.01
+        raw_kept = raw[keep].cpu()
+        raw_boxes = raw_kept[:, :4].numpy()      # xywh (center format, pixel coords)
+        raw_obj   = raw_kept[:, 4].numpy()       # objectness score
+        raw_cls   = raw_kept[:, 5:].numpy()      # per-class probabilities [M, 80]
 
         if attack_type == "CA":
-            w, h = patch.w, patch.h
+            pw, ph = patch.w, patch.h
         elif attack_type == "HA":
-            w, h = patch2.w, patch2.h
+            pw, ph = patch2.w, patch2.h
         gt_box = torch.tensor([[
-            pos[1] + (1 - set_resize) * w * 0.5,
-            pos[0] + (1 - set_resize) * h * 0.5,
-            pos[1] + (1 + set_resize) * w * 0.5,
-            pos[0] + (1 + set_resize) * h * 0.5,
+            pos[1] + (1 - set_resize) * pw * 0.5,
+            pos[0] + (1 - set_resize) * ph * 0.5,
+            pos[1] + (1 + set_resize) * pw * 0.5,
+            pos[0] + (1 + set_resize) * ph * 0.5,
             patch.target,
         ]])
 
@@ -241,44 +250,72 @@ def eval(test_loader):
 
         s = 0
         if attack_type == "HA":
-            if not flag:  # success = object hidden
+            if not flag:
                 s = 1
         elif attack_type == "CA":
-            if flag:      # success = object created
+            if flag:
                 s = 1
         success += s
 
-        log = [set_resize, np.degrees(set_rotate), s]
-        logs.append(log)
-        
+        results.append({
+            "image_idx":   i,
+            "set_resize":  set_resize,
+            "set_rotate":  np.degrees(set_rotate),
+            "patch_pos":   pos,
+            "gt_box":      gt_box.numpy(),
+            # post-NMS final detections: [x1,y1,x2,y2,conf,cls]
+            "nms_detections": pred.cpu().numpy(),
+            # pre-NMS (obj > 0.01): raw boxes/scores before any filtering
+            "raw_boxes":   raw_boxes,   # [M,4] xywh center-format pixel coords
+            "raw_obj":     raw_obj,     # [M]   objectness
+            "raw_cls":     raw_cls,     # [M,80] per-class probability
+            "attack_success": s,
+        })
+
         pbar.update(1)
 
         if i == 10:
             t2 = datetime.now()
-            pred_time = (t2-t1) * (num-10) / 10
+            pred_time = (t2 - t1) * (num - 10) / 10
             print("pred time:", pred_time)
         if i == num:
             break
-    return success, logs
 
+    if results_path is not None:
+        with open(results_path, "wb") as f:
+            pickle.dump(results, f)
+        print(f"Results saved to {results_path}")
+
+    return success, results
+
+
+eval_only = False  # set True to skip training and only run evaluation
 
 def main():
+    results_path = save_path.replace(".png", "_results.pkl")
     decay_epoch = 2
     n_decay = 3
     for e in range(1, decay_epoch * n_decay + 1):
         print(f"Memory allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
         print(f"Memory reserved: {torch.cuda.memory_reserved() / 1024**2:.2f} MB")
-        
-        print(f"Epoch {e}: start training...")
-        losses = train(loader1)
-        print(losses)
+
+        if not eval_only:
+            print(f"Epoch {e}: start training...")
+            losses = train(loader1)
+            print(losses)
+
         print(f"Epoch {e}: start evaluating...")
         with torch.no_grad():
-            sucs, logs = eval(loader2)
+            sucs, _ = eval(loader2, results_path=results_path)
         print(f"Attack success: {sucs}/{num}")
-        patch.save(save_path)
-        if e % decay_epoch == 0:
-            patch.opt.lr *= 0.3
+
+        if not eval_only:
+            patch.save(save_path)
+            if e % decay_epoch == 0:
+                patch.opt.lr *= 0.3
+
+        if eval_only:
+            break  # single eval pass when not training
 
 if __name__ == "__main__":
     main()

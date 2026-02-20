@@ -377,13 +377,15 @@ class YOLOv5(nn.Module):
         
         sys.path = [x for x in sys.path if "yolov5" not in x]
 
-    def forward(self, x, y=None, reverse=False, hiding=False):
+    def forward(self, x, y=None, reverse=False, hiding=False, return_raw=False):
         if y is None:
             if self.training:
                 raise NotImplementedError
             else:
                 pred = self.model(x)[0]
                 ret = self.nms(pred)
+            if return_raw:
+                return ret, pred
             return ret
         elif hiding:
             if self.training:
@@ -421,13 +423,15 @@ class YOLOv3(nn.Module):
         
         sys.path = [x for x in sys.path if "yolov3" not in x]
 
-    def forward(self, x, y=None, reverse=False, hiding=False):
+    def forward(self, x, y=None, reverse=False, hiding=False, return_raw=False):
         if y is None:
             if self.training:
                 raise NotImplementedError
             else:
                 pred = self.model(x)[0]
                 ret = self.nms(pred)
+            if return_raw:
+                return ret, pred
             return ret
         elif hiding:
             if self.training:
