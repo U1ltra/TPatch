@@ -58,8 +58,6 @@ elif model_type == "yolov5":
     names = converter.category80
 target_id = names.index(target_name)
 model = get_det_model(device, model_type)
-trigger_gen = TriggerRegion((0.02, 0.08), (100., 140.), (0, 20)) # configure blur parameters
-trigger_func = lambda x, tr: stn_blur_general(x, tr[0], tr[1], math.radians(tr[2]), 60, device) # generate and apply blur kernel
 
 bgsize = (200, 200)
 
@@ -75,7 +73,6 @@ repeat = 20
 num = 100
 lr = 1e-2
 momentum = 0.9
-alpha = 0.4 if attack_type == "CA" else 5
 beta = 3e-6 if attack_type == "CA" else 3e-6
 ceta = 3e-3 if attack_type == "CA" else 3e-3
 delta = 1e-6 if attack_type == "CA" else 1e-6
@@ -129,20 +126,7 @@ print(datetime.now())
 print(save_path)
 print(attack_type)
 print(model_type)
-print(alpha, beta, ceta, delta, psize)
-
-def pn_loss(imgo, gt_box, dummy_box, p_tr, n_tr):
-    imgp = trigger_func(imgo, p_tr)
-    if attack_type == "CA":
-        loss1 = model(imgp, gt_box)
-    elif attack_type == "HA":
-        loss1 = model(imgp, gt_box, hiding=True)
-    imgn = trigger_func(imgo, n_tr)
-    if attack_type == "CA":
-        loss2 = model(imgn, gt_box, hiding=True)
-    elif attack_type == "HA":
-        loss2 = model(imgn, gt_box)
-    return loss1, loss2
+print(beta, ceta, delta, psize)
 
 
 def train(train_loader):
@@ -151,7 +135,7 @@ def train(train_loader):
     else:
         model.eval()
     t1 = datetime.now()
-    log_loss = torch.zeros(4, device=device)
+    log_loss = torch.zeros(3, device=device)
     
     pbar = tqdm(total=epoch * repeat)
     pbar.set_description("Training")
@@ -166,7 +150,7 @@ def train(train_loader):
             if attack_type == "CA":
                 pos = patch.random_pos((h, w))
                 imgo = patch.apply(img, pos)
-                gt_box, dummy_box = _make_boxes(patch, pos, model_type[:4].upper())
+                gt_box, _ = _make_boxes(patch, pos, model_type[:4].upper())
                 last_scale = patch.last_scale
             elif attack_type == "HA":
                 pos2 = patch2.random_pos((h, w))
@@ -178,25 +162,21 @@ def train(train_loader):
                     relpos2 = (relpos3[0] + dx, relpos3[1] + dy)
                     patch2.data = patch.apply(patch2.data, relpos2, do_random_color=True)
                 imgo = patch2.apply(img, pos2, do_random_color=False)
-                gt_box, dummy_box = _make_boxes(patch2, pos2, model_type[:4].upper())
+                gt_box, _ = _make_boxes(patch2, pos2, model_type[:4].upper())
                 last_scale = patch2.last_scale
 
-            p_tr = trigger_gen.sample_pos()
-            n_tr = trigger_gen.sample_neg()
-            
-            loss1, loss2 = pn_loss(imgo, gt_box, dummy_box, p_tr, n_tr)
+            loss1 = model(imgo, gt_box, hiding=True)
             loss3 = tv_loss(patch.data)
             loss4 = content_loss(patch.data)
-            loss = (1/last_scale**2)*(loss1 + alpha*loss2) + beta*loss3 + ceta*loss4
+            loss = (1/last_scale**2)*loss1 + beta*loss3 + ceta*loss4
             if torch.isnan(loss).any(): continue
-            log_loss += torch.tensor((loss1.item(), loss2.item(), loss3.item(), loss4.item()), device=device)
+            log_loss += torch.tensor((loss1.item(), loss3.item(), loss4.item()), device=device)
             patch.update(loss)
-            
+
             pbar.update(1)
             pbar.set_postfix({
                 "loss": f"{loss.item():.4f}",
                 "loss1": f"{loss1.item():.4f}",
-                "loss2": f"{loss2.item():.4f}",
                 "loss3": f"{loss3.item():.4f}",
                 "loss4": f"{loss4.item():.4f}"
             })
@@ -213,7 +193,7 @@ def train(train_loader):
 def eval(test_loader):
     model.eval()
     t1 = datetime.now()
-    success, success_1, success_2 = 0, 0, 0
+    success = 0
     logs = []
     
     pbar = tqdm(total=num)
@@ -243,54 +223,32 @@ def eval(test_loader):
                 patch2.data = patch.apply(patch2.data, relpos2, test_mode=True, do_random_color=False)
             imgo = patch2.apply(img, pos, test_mode=True, set_resize=set_resize, set_rotate=set_rotate, do_random_color=True)
 
-        p_tr = trigger_gen.sample_pos()
-        imgp = trigger_func(imgo, p_tr)
-        n_tr = trigger_gen.sample_neg()
-        imgn = trigger_func(imgo, n_tr)
-
-        pred1 = model(imgn)[0]
-        pred2 = model(imgp)[0]
+        pred = model(imgo)[0]
 
         if attack_type == "CA":
             w, h = patch.w, patch.h
         elif attack_type == "HA":
             w, h = patch2.w, patch2.h
         gt_box = torch.tensor([[
-            pos[1] + (1 - set_resize) * w * 0.5, 
-            pos[0] + (1 - set_resize) * h * 0.5, 
-            pos[1] + (1 + set_resize) * w * 0.5, 
-            pos[0] + (1 + set_resize) * h * 0.5, 
+            pos[1] + (1 - set_resize) * w * 0.5,
+            pos[0] + (1 - set_resize) * h * 0.5,
+            pos[1] + (1 + set_resize) * w * 0.5,
+            pos[0] + (1 + set_resize) * h * 0.5,
             patch.target,
         ]])
 
-        flag1 = isappear(pred1.cpu(), gt_box)
-        flag2 = isappear(pred2.cpu(), gt_box)
+        flag = isappear(pred.cpu(), gt_box)
 
-        s, s1, s2 = 0, 0, 0
+        s = 0
         if attack_type == "HA":
-            if flag1 and not flag2:
+            if not flag:  # success = object hidden
                 s = 1
-            if flag1:
-                s1 = 1
-            if not flag2:
-                s2 = 1
         elif attack_type == "CA":
-            if not flag1 and flag2:
+            if flag:      # success = object created
                 s = 1
-            if not flag1:
-                s1 = 1
-            if flag2:
-                s2 = 1
         success += s
-        success_1 += s1
-        success_2 += s2
 
-        p_r = (p_tr[0]**2 + p_tr[1]**2)**0.5
-        p_th = np.arctan2(p_tr[0], p_tr[1])
-        n_r = (n_tr[0]**2 + n_tr[1]**2)**0.5
-        n_th = np.arctan2(n_tr[0], n_tr[1])
-        log = [set_resize, np.degrees(set_rotate), p_r, np.degrees(p_th), p_tr[2], 
-               n_r, np.degrees(n_th), n_tr[2], s1, s2, s]
+        log = [set_resize, np.degrees(set_rotate), s]
         logs.append(log)
         
         pbar.update(1)
@@ -301,7 +259,7 @@ def eval(test_loader):
             print("pred time:", pred_time)
         if i == num:
             break
-    return (success, success_1, success_2), logs
+    return success, logs
 
 
 def main():
@@ -317,7 +275,7 @@ def main():
         print(f"Epoch {e}: start evaluating...")
         with torch.no_grad():
             sucs, logs = eval(loader2)
-        print(sucs)
+        print(f"Attack success: {sucs}/{num}")
         patch.save(save_path)
         if e % decay_epoch == 0:
             patch.opt.lr *= 0.3
