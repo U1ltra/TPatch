@@ -263,6 +263,8 @@ def eval(test_loader, results_path=None):
             "set_rotate":  np.degrees(set_rotate),
             "patch_pos":   pos,
             "gt_box":      gt_box.numpy(),
+            # patched image as uint8 HWC numpy array for visualization
+            "img_np": imgo[0].cpu().clamp(0, 1).mul(255).permute(1, 2, 0).byte().numpy(),
             # post-NMS final detections: [x1,y1,x2,y2,conf,cls]
             "nms_detections": pred.cpu().numpy(),
             # pre-NMS (obj > 0.01): raw boxes/scores before any filtering
