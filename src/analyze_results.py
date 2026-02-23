@@ -70,6 +70,26 @@ def centers_inside(cx, cy, xyxy):
     return (cx >= x1) & (cx <= x2) & (cy >= y1) & (cy <= y2)
 
 
+def iou_with_gt(raw_boxes_xywh, gt_xyxy):
+    """
+    Compute IoU between each anchor [M,4 xywh] and a single GT box [4 xyxy].
+    Returns (mask, iou_vals) where mask is a boolean array for IoU > 0.
+    """
+    anchors = xywh_to_xyxy(raw_boxes_xywh)           # [M,4] xyxy
+    ix1 = np.maximum(anchors[:, 0], gt_xyxy[0])
+    iy1 = np.maximum(anchors[:, 1], gt_xyxy[1])
+    ix2 = np.minimum(anchors[:, 2], gt_xyxy[2])
+    iy2 = np.minimum(anchors[:, 3], gt_xyxy[3])
+    inter_w = np.maximum(0.0, ix2 - ix1)
+    inter_h = np.maximum(0.0, iy2 - iy1)
+    inter   = inter_w * inter_h
+    area_a  = (anchors[:, 2] - anchors[:, 0]) * (anchors[:, 3] - anchors[:, 1])
+    area_g  = (gt_xyxy[2] - gt_xyxy[0]) * (gt_xyxy[3] - gt_xyxy[1])
+    union   = area_a + area_g - inter
+    iou     = np.where(union > 0, inter / union, 0.0)
+    return iou > 0, iou
+
+
 def draw_box(ax, xyxy, label=None, color='red', linestyle='-', lw=2, fontsize=9):
     x1, y1, x2, y2 = xyxy
     rect = mpatches.Rectangle(
@@ -199,38 +219,168 @@ def visualize_entry(entry, out_path=None):
     ax.set_xlim(0, img_w); ax.set_ylim(img_h, 0); ax.axis('off')
 
     # ------------------------------------------------------------------
-    # Panel 3 — Score distribution: in-box vs out-of-box
+    # Panel 3 — obj vs cls-prob scatter with NMS filter boundaries
+    #
+    # NMS applies two independent filters:
+    #   1. obj > 0.25          (vertical line)  — objectness pre-filter
+    #   2. obj × cls > 0.25   (hyperbola)       — combined confidence filter
+    # Anchors must clear BOTH to become detection candidates (green zone).
     # ------------------------------------------------------------------
     ax = axes[2]
-    bins = np.linspace(0, 1, 51)
 
-    groups = [
-        (in_gt,  f'inside GT box  (n={n_in})',  'crimson',   0.85),
-        (~in_gt, f'outside GT box (n={n_out})', 'steelblue', 0.5),
-    ]
-    for mask, label, color, alpha in groups:
-        if mask.sum() == 0:
-            continue
-        ax.hist(raw_score[mask], bins=bins, label=label, color=color,
-                alpha=alpha, density=True)
+    # draw background zones
+    obj_range = np.linspace(NMS_CONF_THRESH, 1.0, 300)
+    cls_boundary = np.minimum(NMS_CONF_THRESH / obj_range, 1.0)
+    ax.fill_between(obj_range, cls_boundary, 1.0, alpha=0.07, color='green')  # survivor zone
 
-    ax.axvline(NMS_CONF_THRESH, color='gray', linestyle='--', linewidth=1.2,
-               label=f'NMS threshold ({NMS_CONF_THRESH})')
+    # out-of-box anchors: small, blue, semi-transparent
+    if n_out > 0:
+        ax.scatter(raw_obj[~in_gt], raw_tcls[~in_gt],
+                   s=20, alpha=0.7, color='steelblue', linewidths=0, rasterized=True,
+                   label=f'outside GT box (n={n_out})')
 
-    # annotate max in-box score
+    # in-box anchors: larger, red diamonds — always render on top
     if n_in > 0:
-        max_in = raw_score[in_gt].max()
-        ax.axvline(max_in, color='crimson', linestyle=':', linewidth=1.2,
-                   label=f'max in-box score ({max_in:.3f})')
+        ax.scatter(raw_obj[in_gt], raw_tcls[in_gt],
+                   s=35, alpha=0.9, color='crimson', marker='D', linewidths=0.4,
+                   edgecolors='white', rasterized=True,
+                   label=f'inside GT box (n={n_in})')
 
-    ax.set_xlabel(f'obj × {t_name} prob', fontsize=10)
-    ax.set_ylabel('Density', fontsize=10)
+        # label top-3 in-box anchors with their argmax predicted class
+        top3_idx = np.argsort(raw_score[in_gt])[-3:][::-1]
+        in_obj  = raw_obj[in_gt]
+        in_tcls = raw_tcls[in_gt]
+        in_cls  = raw_cls[in_gt]
+        for k in top3_idx:
+            argmax_cls = int(in_cls[k].argmax())
+            ax.annotate(
+                cls_name(argmax_cls),
+                (in_obj[k], in_tcls[k]),
+                xytext=(4, 4), textcoords='offset points',
+                fontsize=7, color='crimson',
+            )
+
+    # NMS boundary lines
+    ax.axvline(NMS_CONF_THRESH, color='dimgray', linestyle='--', linewidth=1.2,
+               label=f'① obj pre-filter ({NMS_CONF_THRESH})')
+    ax.plot(obj_range, cls_boundary, color='black', linestyle=':', linewidth=1.2,
+            label=f'② combined filter (obj×cls={NMS_CONF_THRESH})')
+    ax.text(0.97, 0.97, 'detection\nzone', transform=ax.transAxes,
+            ha='right', va='top', fontsize=8, color='green', alpha=0.7)
+
+    ax.set_xlabel('Objectness (raw)', fontsize=10)
+    ax.set_ylabel(f'{t_name} class prob (raw)', fontsize=10)
     ax.set_title(
-        'Pre-NMS Score Distribution\n(in-box vs out-of-box anchors)',
+        'Pre-NMS: obj vs class prob\n(labels = argmax class of top-3 in-box anchors)',
         fontsize=11,
     )
-    ax.legend(fontsize=8)
-    ax.set_xlim(0, 1)
+    # ax.legend(fontsize=8, loc='lower right')
+    # legend outside the plot area to avoid overlapping with data points
+    ax.legend(fontsize=8, loc='center left', bbox_to_anchor=(1.02, 0.5))
+    ax.set_xlim(0, 1); ax.set_ylim(0, 1)
+
+    plt.tight_layout()
+
+    if out_path:
+        plt.savefig(out_path, dpi=150, bbox_inches='tight')
+        print(f"  saved → {out_path}")
+    else:
+        plt.show()
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# IoU-based scatter figure
+# ---------------------------------------------------------------------------
+
+def visualize_iou_scatter(entry, out_path=None):
+    """
+    Scatter: objectness (x) vs max class probability (y) for every pre-NMS anchor
+    that has non-zero IoU with the GT bounding box.
+
+      Red diamond  — argmax class IS the target (stop sign)
+      Blue circle  — argmax class is something else
+    """
+    target_cls = int(entry['gt_box'][0, 4])
+    gt_xyxy    = entry['gt_box'][0, :4]
+    raw_boxes  = entry['raw_boxes']    # [M,4] xywh
+    raw_obj    = entry['raw_obj']      # [M]
+    raw_cls    = entry['raw_cls']      # [M,80]
+
+    has_iou, iou_vals = iou_with_gt(raw_boxes, gt_xyxy)
+    n_total = int(has_iou.sum())
+
+    t_name  = cls_name(target_cls)
+    s_str   = "HIDDEN ✓" if entry['attack_success'] else "DETECTED ✗"
+    s_color = "green" if entry['attack_success'] else "red"
+
+    fig, ax = plt.subplots(figsize=(7, 6))
+    fig.suptitle(
+        f"Image #{entry['image_idx']}  |  "
+        f"resize={entry['set_resize']:.2f}  rotate={entry['set_rotate']:.1f}°  |  "
+        f"[{s_str}]",
+        fontsize=12, fontweight='bold', color=s_color,
+    )
+
+    if n_total == 0:
+        ax.text(0.5, 0.5, 'No anchors overlap GT box',
+                transform=ax.transAxes, ha='center', va='center', fontsize=12)
+    else:
+        obj_f  = raw_obj[has_iou]          # [N]
+        cls_f  = raw_cls[has_iou]          # [N,80]
+        max_p  = cls_f.max(axis=1)         # [N] highest class prob
+        argmax = cls_f.argmax(axis=1)      # [N] which class
+        is_tgt = argmax == target_cls
+
+        n_red  = int(is_tgt.sum())
+        n_blue = n_total - n_red
+
+        # plot non-target first so target points render on top
+        if n_blue > 0:
+            ax.scatter(obj_f[~is_tgt], max_p[~is_tgt],
+                       s=25, alpha=0.6, color='steelblue', linewidths=0,
+                       rasterized=True,
+                       label=f'other class (n={n_blue})')
+        if n_red > 0:
+            ax.scatter(obj_f[is_tgt], max_p[is_tgt],
+                       s=40, alpha=0.9, color='crimson', marker='D',
+                       linewidths=0.4, edgecolors='white', rasterized=True,
+                       label=f'{t_name} (n={n_red})')
+
+        # annotate top-3 points by objectness across ALL points
+        top_k   = min(3, n_total)
+        top_idx = np.argsort(obj_f)[-top_k:][::-1]
+        for k in top_idx:
+            ac    = int(argmax[k])
+            color = 'crimson' if is_tgt[k] else 'steelblue'
+            ax.annotate(
+                cls_name(ac),
+                (obj_f[k], max_p[k]),
+                xytext=(4, 4), textcoords='offset points',
+                fontsize=7, color=color,
+            )
+
+        # NMS boundary lines (same as Panel 3)
+        obj_range    = np.linspace(NMS_CONF_THRESH, 1.0, 300)
+        cls_boundary = np.minimum(NMS_CONF_THRESH / obj_range, 1.0)
+        ax.fill_between(obj_range, cls_boundary, 1.0, alpha=0.07, color='green')
+        ax.axvline(NMS_CONF_THRESH, color='dimgray', linestyle='--', linewidth=1.2,
+                   label=f'① obj pre-filter ({NMS_CONF_THRESH})')
+        ax.plot(obj_range, cls_boundary, color='black', linestyle=':', linewidth=1.2,
+                label=f'② combined filter (obj×cls={NMS_CONF_THRESH})')
+        ax.text(0.97, 0.97, 'detection\nzone', transform=ax.transAxes,
+                ha='right', va='top', fontsize=8, color='green', alpha=0.7)
+
+        ax.legend(fontsize=9, loc='lower right')
+
+    ax.set_xlabel('Objectness (raw)', fontsize=11)
+    ax.set_ylabel('Max class probability (over all classes)', fontsize=11)
+    ax.set_title(
+        f'Anchors with IoU > 0 vs GT box  (N={n_total})\n'
+        f'Red ◆ = argmax is {t_name}  ·  Blue = other class',
+        fontsize=11,
+    )
+    ax.set_xlim(0, 1); ax.set_ylim(0, 1)
 
     plt.tight_layout()
 
@@ -267,13 +417,31 @@ def print_summary(results):
             in_box_scores.append(0.0)
 
     scores = np.array(in_box_scores)
-    print(f"\nMax pre-NMS in-box score (obj × cls) over {n} images:")
+    print(f"\nMax pre-NMS in-box score (obj × stop-sign cls) over {n} images:")
     print(f"  mean : {scores.mean():.4f}")
     print(f"  std  : {scores.std():.4f}")
     print(f"  min  : {scores.min():.4f}")
     print(f"  max  : {scores.max():.4f}")
-    print(f"  > NMS threshold ({NMS_CONF_THRESH}): "
+    print(f"  > NMS combined threshold ({NMS_CONF_THRESH}): "
           f"{(scores > NMS_CONF_THRESH).sum()} / {n} images")
+
+    # Class confusion: for in-box anchors with obj > NMS_CONF_THRESH,
+    # what class does the model actually predict?
+    from collections import Counter
+    argmax_counts = Counter()
+    for r in results:
+        gt_xyxy = r['gt_box'][0, :4]
+        cx, cy  = r['raw_boxes'][:, 0], r['raw_boxes'][:, 1]
+        in_gt   = centers_inside(cx, cy, gt_xyxy)
+        high_obj = r['raw_obj'] > NMS_CONF_THRESH
+        mask = in_gt & high_obj
+        if mask.sum() > 0:
+            top_cls = r['raw_cls'][mask].argmax(axis=1)
+            argmax_counts.update(top_cls.tolist())
+    if argmax_counts:
+        print(f"\nArgmax class of in-box anchors with obj > {NMS_CONF_THRESH}:")
+        for cls_id, count in argmax_counts.most_common(5):
+            print(f"  {cls_name(cls_id):20s}: {count}")
     print(f"{'='*50}\n")
 
 
@@ -312,8 +480,9 @@ def main():
         os.makedirs(viz_dir, exist_ok=True)
         print(f"Saving {len(results)} visualizations to {viz_dir}/")
         for entry in results:
-            out = os.path.join(viz_dir, f"{entry['image_idx']:04d}.png")
-            visualize_entry(entry, out_path=out)
+            idx_str = f"{entry['image_idx']:04d}"
+            visualize_entry(entry, out_path=os.path.join(viz_dir, f"{idx_str}.png"))
+            visualize_iou_scatter(entry, out_path=os.path.join(viz_dir, f"{idx_str}_iou.png"))
     else:
         if args.idx >= len(results):
             print(f"ERROR: --idx {args.idx} out of range (max {len(results)-1})")
@@ -322,6 +491,14 @@ def main():
         print(f"Visualizing entry idx={args.idx}  image_idx={entry['image_idx']}  "
               f"success={entry['attack_success']}")
         visualize_entry(entry, out_path=args.out)
+        # IoU scatter: derive output path from --out if provided
+        if args.out:
+            iou_out = args.out.replace('.png', '_iou.png')
+            if iou_out == args.out:
+                iou_out = args.out + '_iou.png'
+        else:
+            iou_out = None
+        visualize_iou_scatter(entry, out_path=iou_out)
 
 
 if __name__ == '__main__':
