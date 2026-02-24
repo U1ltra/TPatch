@@ -1,0 +1,190 @@
+"""
+IoU distribution across all pre-NMS predictions, averaged over entries.
+
+For each entry, every pre-NMS anchor's IoU with the GT box is computed and
+binned into [0.0-0.1, 0.1-0.2, ..., 0.9-1.0].  Each bin count is expressed
+as a percentage of the total anchors in that entry.  These per-entry
+percentages are then averaged separately for:
+
+  • entries where the hiding attack succeeded  (green)
+  • entries where the hiding attack failed     (red)
+
+The result is a grouped bar chart showing the mean percentage ± std per bin.
+
+Usage:
+    python iou_distribution.py demo/20260220-131307_results.pkl
+    python iou_distribution.py demo/20260220-131307_results.pkl --out iou_dist.png
+    python iou_distribution.py demo/20260220-131307_results.pkl --no-std
+"""
+
+# import _init_path
+import argparse
+import pickle
+import numpy as np
+import matplotlib.pyplot as plt
+
+N_BINS   = 10
+BIN_EDGES = np.linspace(0.0, 1.0, N_BINS + 1)   # [0.0, 0.1, ..., 1.0]
+BIN_LABELS = [f"{BIN_EDGES[i]:.1f}–{BIN_EDGES[i+1]:.1f}" for i in range(N_BINS)]
+
+
+def xywh_to_xyxy(boxes):
+    x1 = boxes[:, 0] - boxes[:, 2] / 2
+    y1 = boxes[:, 1] - boxes[:, 3] / 2
+    x2 = boxes[:, 0] + boxes[:, 2] / 2
+    y2 = boxes[:, 1] + boxes[:, 3] / 2
+    return np.stack([x1, y1, x2, y2], axis=1)
+
+
+def iou_all(raw_boxes_xywh, gt_xyxy):
+    """IoU between every anchor [M,4 xywh] and one GT box [4 xyxy]. Returns [M]."""
+    anchors = xywh_to_xyxy(raw_boxes_xywh)
+    ix1 = np.maximum(anchors[:, 0], gt_xyxy[0])
+    iy1 = np.maximum(anchors[:, 1], gt_xyxy[1])
+    ix2 = np.minimum(anchors[:, 2], gt_xyxy[2])
+    iy2 = np.minimum(anchors[:, 3], gt_xyxy[3])
+    inter = np.maximum(0.0, ix2 - ix1) * np.maximum(0.0, iy2 - iy1)
+    area_a = (anchors[:, 2] - anchors[:, 0]) * (anchors[:, 3] - anchors[:, 1])
+    area_g = (gt_xyxy[2] - gt_xyxy[0]) * (gt_xyxy[3] - gt_xyxy[1])
+    union  = area_a + area_g - inter
+    return np.where(union > 0, inter / union, 0.0)
+
+
+def entry_iou_percentages(entry):
+    """
+    Returns a length-N_BINS array of percentages (sum = 100) for one entry.
+    IoU == 1.0 is included in the last bin [0.9, 1.0].
+    """
+    gt_xyxy   = entry['gt_box'][0, :4]
+    raw_boxes = entry['raw_boxes']
+    iou       = iou_all(raw_boxes, gt_xyxy)                     # [M]
+
+    # clip so IoU=1.0 lands in bin index 9 (not 10)
+    bin_idx = np.clip(np.floor(iou * N_BINS).astype(int), 0, N_BINS - 1)
+    counts  = np.bincount(bin_idx, minlength=N_BINS).astype(float)
+    total   = counts.sum()
+    return (counts / total * 100.0) if total > 0 else counts
+
+
+def collect_distributions(results):
+    """
+    Returns two arrays:
+      success_pcts  [S, N_BINS]  — per-entry percentages for successful entries
+      failure_pcts  [F, N_BINS]  — per-entry percentages for failed entries
+    """
+    success_rows, failure_rows = [], []
+    for entry in results:
+        pct = entry_iou_percentages(entry)
+        if entry['attack_success']:
+            success_rows.append(pct)
+        else:
+            failure_rows.append(pct)
+
+    success_pcts = np.array(success_rows) if success_rows else np.empty((0, N_BINS))
+    failure_pcts = np.array(failure_rows) if failure_rows else np.empty((0, N_BINS))
+    return success_pcts, failure_pcts
+
+
+def plot_iou_distribution(success_pcts, failure_pcts, show_std=True, out_path=None):
+    """
+    Grouped bar chart: mean percentage per IoU bin for success vs failure.
+    Error bars show ±1 std when show_std=True.
+    """
+    n_s = success_pcts.shape[0]
+    n_f = failure_pcts.shape[0]
+
+    mean_s = success_pcts.mean(axis=0) if n_s > 0 else np.zeros(N_BINS)
+    mean_f = failure_pcts.mean(axis=0) if n_f > 0 else np.zeros(N_BINS)
+    std_s  = success_pcts.std(axis=0)  if n_s > 0 else np.zeros(N_BINS)
+    std_f  = failure_pcts.std(axis=0)  if n_f > 0 else np.zeros(N_BINS)
+
+    x      = np.arange(N_BINS)
+    width  = 0.38
+    offset = width / 2
+
+    fig, ax = plt.subplots(figsize=(11, 5))
+
+    err_kw = dict(capsize=4, capthick=1.2, elinewidth=1.2)
+
+    bars_s = ax.bar(
+        x - offset, mean_s, width,
+        color='seagreen', alpha=0.82, label=f'Attack success  (n={n_s})',
+        yerr=(std_s if show_std else None), error_kw=err_kw,
+    )
+    bars_f = ax.bar(
+        x + offset, mean_f, width,
+        color='tomato', alpha=0.82, label=f'Attack failure  (n={n_f})',
+        yerr=(std_f if show_std else None), error_kw=err_kw,
+    )
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(BIN_LABELS, rotation=30, ha='right', fontsize=9)
+    ax.set_xlabel('IoU bin (pre-NMS anchor vs GT box)', fontsize=11)
+    ax.set_ylabel('Mean % of anchors per entry', fontsize=11)
+    ax.set_title(
+        'Pre-NMS anchor IoU distribution  —  success vs failure\n'
+        + (f'Error bars: ±1 std  (n_success={n_s}, n_failure={n_f})'
+           if show_std else f'n_success={n_s},  n_failure={n_f}'),
+        fontsize=12,
+    )
+    ax.legend(fontsize=10)
+    ax.set_xlim(-0.6, N_BINS - 0.4)
+    ax.yaxis.grid(True, linestyle='--', alpha=0.5)
+    ax.set_axisbelow(True)
+
+    plt.tight_layout()
+
+    if out_path:
+        plt.savefig(out_path, dpi=150, bbox_inches='tight')
+        print(f"Saved → {out_path}")
+    else:
+        plt.show()
+    plt.close(fig)
+
+
+def print_table(success_pcts, failure_pcts):
+    n_s = success_pcts.shape[0]
+    n_f = failure_pcts.shape[0]
+    mean_s = success_pcts.mean(axis=0) if n_s > 0 else np.zeros(N_BINS)
+    mean_f = failure_pcts.mean(axis=0) if n_f > 0 else np.zeros(N_BINS)
+    std_s  = success_pcts.std(axis=0)  if n_s > 0 else np.zeros(N_BINS)
+    std_f  = failure_pcts.std(axis=0)  if n_f > 0 else np.zeros(N_BINS)
+
+    print(f"\n{'IoU bin':<12}  {'success mean±std':>18}  {'failure mean±std':>18}")
+    print("-" * 54)
+    for i, label in enumerate(BIN_LABELS):
+        print(f"{label:<12}  {mean_s[i]:6.2f} ± {std_s[i]:5.2f}    "
+              f"{mean_f[i]:6.2f} ± {std_f[i]:5.2f}")
+    print()
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='IoU distribution of pre-NMS anchors vs GT box',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument('pkl', help='Path to *_results.pkl from demo.py eval()')
+    parser.add_argument('--out', default=None,
+                        help='Output PNG path (default: show interactively)')
+    parser.add_argument('--no-std', action='store_true',
+                        help='Hide std error bars')
+    args = parser.parse_args()
+
+    with open(args.pkl, 'rb') as f:
+        results = pickle.load(f)
+
+    n_total   = len(results)
+    n_success = sum(r['attack_success'] for r in results)
+    print(f"Loaded {n_total} entries  |  "
+          f"success: {n_success}  failure: {n_total - n_success}")
+
+    success_pcts, failure_pcts = collect_distributions(results)
+    print_table(success_pcts, failure_pcts)
+    plot_iou_distribution(success_pcts, failure_pcts,
+                          show_std=not args.no_std,
+                          out_path=args.out)
+
+
+if __name__ == '__main__':
+    main()
