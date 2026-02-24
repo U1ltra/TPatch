@@ -71,7 +71,7 @@ eot_scale = 0.2
 eot_angle = math.pi / 9
 epoch = 50
 repeat = 20
-num = 100
+num = 500
 lr = 1e-2
 momentum = 0.9
 beta = 3e-6 if attack_type == "CA" else 3e-6
@@ -109,7 +109,7 @@ tv_loss = TVLoss()
 filename = datetime.now().strftime("%Y%m%d-%H%M%S") + ".png"
 
 # === eval only ===
-# filename = "20260223-001547.png"
+filename = "20260223-001547.png"
 # === eval only ===
 
 if attack_type == "HA":
@@ -193,11 +193,16 @@ def train(train_loader):
     return log_loss / (epoch * repeat)
 
 
-def eval(test_loader, results_path=None):
+def eval(test_loader, results_path=None, results_orig_path=None):
     model.eval()
     t1 = datetime.now()
     success = 0
+    success_orig = 0
     results = []
+    results_orig = []
+
+    # Clean stop sign loaded once; used as the "original" baseline for HA
+    orig_sign = quick_load("stop_sign.png")
 
     pbar = tqdm(total=num)
     pbar.set_description("Evaluating")
@@ -211,6 +216,7 @@ def eval(test_loader, results_path=None):
         set_resize = random.uniform(eot_scale, 1)
         set_rotate = random.uniform(-eot_angle, eot_angle)
 
+        # ---- Patched image ----
         if attack_type == "CA":
             pos = patch.random_pos((h, w))
             imgo = patch.apply(img, pos, test_mode=True, set_resize=set_resize,
@@ -218,15 +224,26 @@ def eval(test_loader, results_path=None):
         elif attack_type == "HA":
             pos = patch2.random_pos((h, w))
             relpos2 = (relpos[0], relpos[1])
-            patch2.data = patch.apply(quick_load("stop_sign.png"), relpos2, test_mode=True, do_random_color=False)
+            patch2.data = patch.apply(orig_sign, relpos2, test_mode=True, do_random_color=False)
             if double_apply:
                 relpos2 = (relpos3[0], relpos3[1])
                 patch2.data = patch.apply(patch2.data, relpos2, test_mode=True, do_random_color=False)
             imgo = patch2.apply(img, pos, test_mode=True, set_resize=set_resize, set_rotate=set_rotate, do_random_color=True)
 
-        # get both post-NMS detections and the raw pre-NMS tensor
+        # ---- Original image (no adversarial patch, same pos/transform) ----
+        if attack_type == "CA":
+            imgo_orig = img  # clean scene with no patch
+        elif attack_type == "HA":
+            patch2.data = orig_sign  # reset to clean stop sign
+            imgo_orig = patch2.apply(img, pos, test_mode=True, set_resize=set_resize,
+                                     set_rotate=set_rotate, do_random_color=True)
+
+        # ---- Run detector on both ----
         nms_preds, pred_raw = model(imgo, return_raw=True)
         pred = nms_preds[0]   # post-NMS: [K, 6] = [x1,y1,x2,y2,conf,cls]
+
+        nms_preds_orig, pred_raw_orig = model(imgo_orig, return_raw=True)
+        pred_orig = nms_preds_orig[0]
 
         # --- pre-NMS: filter to objectness > 0.01 to keep file size manageable ---
         raw = pred_raw[0]                        # [N, 5+C]
@@ -235,6 +252,13 @@ def eval(test_loader, results_path=None):
         raw_boxes = raw_kept[:, :4].numpy()      # xywh (center format, pixel coords)
         raw_obj   = raw_kept[:, 4].numpy()       # objectness score
         raw_cls   = raw_kept[:, 5:].numpy()      # per-class probabilities [M, 80]
+
+        raw_o = pred_raw_orig[0]
+        keep_o = raw_o[:, 4] > 0.01
+        raw_kept_o = raw_o[keep_o].cpu()
+        raw_boxes_o = raw_kept_o[:, :4].numpy()
+        raw_obj_o   = raw_kept_o[:, 4].numpy()
+        raw_cls_o   = raw_kept_o[:, 5:].numpy()
 
         if attack_type == "CA":
             pw, ph = patch.w, patch.h
@@ -249,15 +273,22 @@ def eval(test_loader, results_path=None):
         ]])
 
         flag = isappear(pred.cpu(), gt_box)
+        flag_orig = isappear(pred_orig.cpu(), gt_box)
 
         s = 0
+        s_orig = 0
         if attack_type == "HA":
             if not flag:
                 s = 1
+            if not flag_orig:
+                s_orig = 1
         elif attack_type == "CA":
             if flag:
                 s = 1
+            if flag_orig:
+                s_orig = 1
         success += s
+        success_orig += s_orig
 
         results.append({
             "image_idx":   i,
@@ -276,6 +307,20 @@ def eval(test_loader, results_path=None):
             "attack_success": s,
         })
 
+        results_orig.append({
+            "image_idx":   i,
+            "set_resize":  set_resize,
+            "set_rotate":  np.degrees(set_rotate),
+            "patch_pos":   pos,
+            "gt_box":      gt_box.numpy(),
+            "img_np": imgo_orig[0].cpu().clamp(0, 1).mul(255).permute(1, 2, 0).byte().numpy(),
+            "nms_detections": pred_orig.cpu().numpy(),
+            "raw_boxes":   raw_boxes_o,
+            "raw_obj":     raw_obj_o,
+            "raw_cls":     raw_cls_o,
+            "attack_success": s_orig,
+        })
+
         pbar.update(1)
 
         if i == 10:
@@ -290,13 +335,19 @@ def eval(test_loader, results_path=None):
             pickle.dump(results, f)
         print(f"Results saved to {results_path}")
 
-    return success, results
+    if results_orig_path is not None:
+        with open(results_orig_path, "wb") as f:
+            pickle.dump(results_orig, f)
+        print(f"Original results saved to {results_orig_path}")
+
+    return success, results, success_orig, results_orig
 
 
-eval_only = False  # set True to skip training and only run evaluation
+eval_only = True  # set True to skip training and only run evaluation
 
 def main():
     results_path = save_path.replace(".png", "_results.pkl")
+    results_orig_path = save_path.replace(".png", "_results_orig.pkl")
     decay_epoch = 2
     n_decay = 4
     for e in range(1, decay_epoch * n_decay + 1):
@@ -310,8 +361,10 @@ def main():
 
         print(f"Epoch {e}: start evaluating...")
         with torch.no_grad():
-            sucs, _ = eval(loader2, results_path=results_path)
-        print(f"Attack success: {sucs}/{num}")
+            sucs, _, sucs_orig, _ = eval(loader2, results_path=results_path,
+                                         results_orig_path=results_orig_path)
+        print(f"Attack success (patched):  {sucs}/{num}")
+        print(f"Attack success (original): {sucs_orig}/{num}")
 
         if not eval_only:
             patch.save(save_path)
