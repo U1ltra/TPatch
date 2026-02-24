@@ -77,6 +77,8 @@ momentum = 0.9
 beta = 3e-6 if attack_type == "CA" else 3e-6
 ceta = 3e-3 if attack_type == "CA" else 3e-3
 delta = 1e-6 if attack_type == "CA" else 1e-6
+alpha = 0.0   # weight for separate objectness loss
+gamma = 1.0   # weight for separate class-probability loss
 
 
 loader1 = load_coco(coco_img, coco_ann)
@@ -107,7 +109,7 @@ tv_loss = TVLoss()
 filename = datetime.now().strftime("%Y%m%d-%H%M%S") + ".png"
 
 # === eval only ===
-# filename = "137498.png"
+# filename = "20260223-001547.png"
 # === eval only ===
 
 if attack_type == "HA":
@@ -166,10 +168,10 @@ def train(train_loader):
                 gt_box, _ = _make_boxes(patch2, pos2, model_type[:4].upper())
                 last_scale = patch2.last_scale
 
-            loss1 = model(imgo, gt_box, hiding=True)
+            loss1, loss_obj, loss_cls = model(imgo, gt_box, hiding=True)
             loss3 = tv_loss(patch.data)
             loss4 = content_loss(patch.data)
-            loss = (1/last_scale**2)*loss1 + beta*loss3 + ceta*loss4
+            loss = (1/last_scale**2)*(loss1 + alpha*loss_obj + gamma*loss_cls) + beta*loss3 + ceta*loss4
             if torch.isnan(loss).any(): continue
             log_loss += torch.tensor((loss1.item(), loss3.item(), loss4.item()), device=device)
             patch.update(loss)
@@ -296,7 +298,7 @@ eval_only = False  # set True to skip training and only run evaluation
 def main():
     results_path = save_path.replace(".png", "_results.pkl")
     decay_epoch = 2
-    n_decay = 3
+    n_decay = 4
     for e in range(1, decay_epoch * n_decay + 1):
         print(f"Memory allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
         print(f"Memory reserved: {torch.cuda.memory_reserved() / 1024**2:.2f} MB")

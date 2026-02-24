@@ -393,9 +393,12 @@ class YOLOv5(nn.Module):
             else:
                 pred = self.model(x)[0]
                 attack_target = int(y[0, 1])
-                scores = pred[..., 4] * pred[..., 5+attack_target]
-                loss = -torch.log(1 - scores.max())
-            return loss
+                obj  = pred[..., 4]
+                cls  = pred[..., 5+attack_target]
+                loss_prod = -torch.log(1 - (obj * cls).max())
+                loss_obj  = -torch.log(1 - obj.max())
+                loss_cls  = -torch.log(1 - cls.max())
+            return loss_prod, loss_obj, loss_cls
         else:
             if self.training:
                 pred = self.model(x)
@@ -439,9 +442,12 @@ class YOLOv3(nn.Module):
             else:
                 pred = self.model(x)[0]
                 attack_target = int(y[0, 1])
-                scores = pred[..., 4] * pred[..., 5+attack_target]
-                loss = -torch.log(1 - scores.max())
-            return loss
+                obj  = pred[..., 4]
+                cls  = pred[..., 5+attack_target]
+                loss_prod = -torch.log(1 - (obj * cls).max())
+                loss_obj  = -torch.log(1 - obj.max())
+                loss_cls  = -torch.log(1 - cls.max())
+            return loss_prod, loss_obj, loss_cls
         else:
             if self.training:
                 pred = self.model(x)
@@ -503,9 +509,12 @@ class FasterRCNN(nn.Module):
             class_logits, box_regression = self.model.roi_heads.box_predictor(box_features)
 
             confs = F.softmax(class_logits)
-            scores = scores[0] * confs[:, attack_target]
-            loss = -torch.log(1 - scores.max())
-            return loss
+            obj_scores = scores[0]
+            cls_scores = confs[:, attack_target]
+            loss_prod = -torch.log(1 - (obj_scores * cls_scores).max())
+            loss_obj  = -torch.log(1 - obj_scores.max())
+            loss_cls  = -torch.log(1 - cls_scores.max())
+            return loss_prod, loss_obj, loss_cls
         else:
             if not self.training:
                 raise NotImplementedError
