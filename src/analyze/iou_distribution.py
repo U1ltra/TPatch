@@ -341,7 +341,7 @@ def plot_iou_patch_vs_orig(patch_success_pcts, orig_pcts, show_std=True, out_pat
 
     ax.bar(x - offset, mean_p, width,
            color='seagreen', alpha=0.82,
-           label=f'w/ patch — attack success  (n={n_p})',
+           label=f'w/ patch  (n={n_p})',
            yerr=(std_p if show_std else None), error_kw=err_kw)
     ax.bar(x + offset, mean_o, width,
            color='steelblue', alpha=0.82,
@@ -353,7 +353,7 @@ def plot_iou_patch_vs_orig(patch_success_pcts, orig_pcts, show_std=True, out_pat
     ax.set_xlabel('IoU bin (pre-NMS anchor vs GT box)', fontsize=11)
     ax.set_ylabel('Mean % of anchors per entry', fontsize=11)
     ax.set_title(
-        'Pre-NMS anchor IoU distribution  —  w/ patch (attack success) vs w/o patch\n'
+        'Pre-NMS anchor IoU distribution  —  w/ patch vs w/o patch\n'
         + (f'Error bars: ±1 std  (n_patch={n_p}, n_orig={n_o})'
            if show_std else f'n_patch={n_p},  n_orig={n_o}'),
         fontsize=12,
@@ -383,7 +383,7 @@ def print_table_patch_vs_orig(patch_success_pcts, orig_pcts):
 
     col = 26
     print(f"\n{'IoU bin':<12}  "
-          f"{'w/ patch success mean±std':>{col}}  "
+          f"{'w/ patch mean±std':>{col}}  "
           f"{'w/o patch mean±std':>{col}}")
     print("-" * (14 + 2 * (col + 2)))
     for i, label in enumerate(BIN_LABELS):
@@ -417,7 +417,7 @@ def print_score_stats_patch_vs_orig(patch_success_stats, orig_all_stats):
         o_max = fmt(orig_all_stats[key]['max'])
 
         col = 20
-        print(f"\n  {label}  (n_patch_success={n_p}, n_orig={n_o})")
+        print(f"\n  {label}  (n_patch={n_p}, n_orig={n_o})")
         print(f"  {'IoU bin':<12}  "
               f"{'w/patch avg-min':>{col}}  {'w/patch avg-max':>{col}}  "
               f"{'w/o patch avg-min':>{col}}  {'w/o patch avg-max':>{col}}")
@@ -481,20 +481,20 @@ def main():
     n_orig = len(results_orig)
     print(f"\nLoaded {n_orig} original (no-patch) entries from {orig_pkl!r}")
 
-    print("\n=== w/ patch (attack success) vs w/o patch ===")
-    patch_success_stats, _ = collect_score_stats_by_bin(results)
-    # only keep success bucket — already computed above, reuse
-    orig_all_stats = collect_all_score_stats(results_orig)
-    print_score_stats_patch_vs_orig(patch_success_stats, orig_all_stats)
+    print("\n=== w/ patch (all entries) vs w/o patch ===")
+    patch_all_stats = collect_all_score_stats(results)
+    orig_all_stats  = collect_all_score_stats(results_orig)
+    print_score_stats_patch_vs_orig(patch_all_stats, orig_all_stats)
 
-    orig_pcts = collect_all_pcts(results_orig)
-    print_table_patch_vs_orig(success_pcts, orig_pcts)
+    patch_all_pcts = collect_all_pcts(results)
+    orig_pcts      = collect_all_pcts(results_orig)
+    print_table_patch_vs_orig(patch_all_pcts, orig_pcts)
 
     orig_out = None
     if args.out:
         base, ext = os.path.splitext(args.out)
         orig_out = f"{base}_patch_vs_orig{ext}"
-    plot_iou_patch_vs_orig(success_pcts, orig_pcts,
+    plot_iou_patch_vs_orig(patch_all_pcts, orig_pcts,
                            show_std=not args.no_std,
                            out_path=orig_out)
 
