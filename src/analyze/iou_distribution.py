@@ -142,6 +142,101 @@ def plot_iou_distribution(success_pcts, failure_pcts, show_std=True, out_path=No
     plt.close(fig)
 
 
+def collect_score_stats_by_bin(results):
+    """
+    For each entry and each IoU bin, record the MIN and MAX of each metric
+    (objectiveness, max-class-prob, obj×max-class-prob) among the anchors
+    that fall into that bin.  Bins with no anchors contribute NaN.
+
+    Returns two dicts, one for success entries and one for failure entries.
+    Each dict is keyed by metric name ('obj', 'maxp', 'score') and maps to
+    a sub-dict {'min': [N_entries, N_BINS], 'max': [N_entries, N_BINS]}.
+    """
+    def empty_bucket():
+        return {'obj':   {'min': [], 'max': []},
+                'maxp':  {'min': [], 'max': []},
+                'score': {'min': [], 'max': []}}
+
+    success = empty_bucket()
+    failure = empty_bucket()
+
+    for entry in results:
+        raw_obj   = entry['raw_obj']           # [M]
+        raw_cls   = entry['raw_cls']           # [M, 80]
+        gt_xyxy   = entry['gt_box'][0, :4]
+        raw_boxes = entry['raw_boxes']
+
+        iou   = iou_all(raw_boxes, gt_xyxy)    # [M]
+        maxp  = raw_cls.max(axis=1)            # [M]
+        score = raw_obj * maxp                 # [M]
+
+        bin_idx = np.clip(np.floor(iou * N_BINS).astype(int), 0, N_BINS - 1)
+
+        metrics_data = {'obj': raw_obj, 'maxp': maxp, 'score': score}
+        row_min = {k: np.full(N_BINS, np.nan) for k in metrics_data}
+        row_max = {k: np.full(N_BINS, np.nan) for k in metrics_data}
+
+        for b in range(N_BINS):
+            mask = bin_idx == b
+            if mask.any():
+                for k, vals in metrics_data.items():
+                    row_min[k][b] = vals[mask].min()
+                    row_max[k][b] = vals[mask].max()
+
+        bucket = success if entry['attack_success'] else failure
+        for k in metrics_data:
+            bucket[k]['min'].append(row_min[k])
+            bucket[k]['max'].append(row_max[k])
+
+    def to_arr(lst):
+        return np.array(lst) if lst else np.full((0, N_BINS), np.nan)
+
+    for bucket in (success, failure):
+        for k in bucket:
+            bucket[k]['min'] = to_arr(bucket[k]['min'])
+            bucket[k]['max'] = to_arr(bucket[k]['max'])
+
+    return success, failure
+
+
+def print_score_stats_by_bin(success_stats, failure_stats):
+    """
+    For each metric and each IoU bin print the average (across entries) of
+    the per-entry minimum and maximum, separated by success / failure.
+    """
+    metrics = [
+        ('Objectiveness',           'obj'),
+        ('Max class prob',           'maxp'),
+        ('Obj × max class prob',     'score'),
+    ]
+
+    n_s = next(iter(success_stats.values()))['min'].shape[0]
+    n_f = next(iter(failure_stats.values()))['min'].shape[0]
+
+    def fmt(arr, axis=0):
+        """nanmean over entries; returns [N_BINS]."""
+        return np.nanmean(arr, axis=axis) if arr.shape[0] > 0 else np.full(N_BINS, np.nan)
+
+    for label, key in metrics:
+        s_min = fmt(success_stats[key]['min'])
+        s_max = fmt(success_stats[key]['max'])
+        f_min = fmt(failure_stats[key]['min'])
+        f_max = fmt(failure_stats[key]['max'])
+
+        col = 18
+        print(f"\n  {label}  (n_success={n_s}, n_failure={n_f})")
+        print(f"  {'IoU bin':<12}  "
+              f"{'success avg-min':>{col}}  {'success avg-max':>{col}}  "
+              f"{'failure avg-min':>{col}}  {'failure avg-max':>{col}}")
+        print("  " + "-" * (12 + 4 * (col + 2) + 2))
+        for i, bin_label in enumerate(BIN_LABELS):
+            def v(x): return f"{x:.4f}" if not np.isnan(x) else "  n/a  "
+            print(f"  {bin_label:<12}  "
+                  f"{v(s_min[i]):>{col}}  {v(s_max[i]):>{col}}  "
+                  f"{v(f_min[i]):>{col}}  {v(f_max[i]):>{col}}")
+    print()
+
+
 def print_table(success_pcts, failure_pcts):
     n_s = success_pcts.shape[0]
     n_f = failure_pcts.shape[0]
@@ -178,6 +273,9 @@ def main():
     n_success = sum(r['attack_success'] for r in results)
     print(f"Loaded {n_total} entries  |  "
           f"success: {n_success}  failure: {n_total - n_success}")
+
+    success_stats, failure_stats = collect_score_stats_by_bin(results)
+    print_score_stats_by_bin(success_stats, failure_stats)
 
     success_pcts, failure_pcts = collect_distributions(results)
     print_table(success_pcts, failure_pcts)
