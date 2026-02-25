@@ -52,9 +52,27 @@ METRICS = [
 # Feature extraction
 # ---------------------------------------------------------------------------
 
+def _iou_with_gt(raw_boxes_xywh, gt_xyxy):
+    """IoU of every anchor [M,4 xywh] with one GT box [4 xyxy]. Returns [M]."""
+    x1 = raw_boxes_xywh[:, 0] - raw_boxes_xywh[:, 2] / 2
+    y1 = raw_boxes_xywh[:, 1] - raw_boxes_xywh[:, 3] / 2
+    x2 = raw_boxes_xywh[:, 0] + raw_boxes_xywh[:, 2] / 2
+    y2 = raw_boxes_xywh[:, 1] + raw_boxes_xywh[:, 3] / 2
+    ix1 = np.maximum(x1, gt_xyxy[0]);  iy1 = np.maximum(y1, gt_xyxy[1])
+    ix2 = np.minimum(x2, gt_xyxy[2]);  iy2 = np.minimum(y2, gt_xyxy[3])
+    inter  = np.maximum(0.0, ix2 - ix1) * np.maximum(0.0, iy2 - iy1)
+    area_a = (x2 - x1) * (y2 - y1)
+    area_g = (gt_xyxy[2] - gt_xyxy[0]) * (gt_xyxy[3] - gt_xyxy[1])
+    union  = area_a + area_g - inter
+    return np.where(union > 0, inter / union, 0.0)
+
+
 def extract_entry_features(entry):
     """
-    Returns a flat dict of [M]-length arrays for each pre-NMS anchor.
+    Returns a flat dict of [M]-length arrays for each pre-NMS anchor,
+    restricted to anchors with nonzero IoU with the GT box so that
+    unrelated objects / background regions are excluded.
+
     All three geometric features are normalised by the corresponding patch
     dimension so results are entry-independent and directly comparable:
 
@@ -78,11 +96,16 @@ def extract_entry_features(entry):
     gt_size = (gt_w + gt_h) / 2 + 1e-6
 
     raw = entry['raw_boxes']                  # [M, 4] xywh centre-format
+
+    # Keep only anchors that overlap with the GT box
+    iou  = _iou_with_gt(raw, gt)
+    keep = iou >= 0
+    raw  = raw[keep]
     cx, cy = raw[:, 0], raw[:, 1]
     w,  h  = raw[:, 2], raw[:, 3]
 
-    obj   = entry['raw_obj']                  # [M]
-    maxp  = entry['raw_cls'].max(axis=1)      # [M]
+    obj   = entry['raw_obj'][keep]            # [M']
+    maxp  = entry['raw_cls'][keep].max(axis=1)
 
     return {
         'dist':  np.sqrt((cx - gt_cx) ** 2 + (cy - gt_cy) ** 2) / gt_diag,
